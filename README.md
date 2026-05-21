@@ -40,8 +40,8 @@ machine.
 │       app.py         │   Streamlit UI: tabs, sidebar, session state
 └──────────┬───────────┘
            │
-   ┌───────┴────────┐
-   ▼                ▼
+   ┌───────┴───────────────┐
+   ▼                       ▼
 document_processor   semantic_search
    .py                  .py
    │                    │
