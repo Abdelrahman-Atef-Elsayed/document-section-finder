@@ -36,21 +36,22 @@ machine.
 ## Architecture
 
 ```
-┌──────────────────────┐
-│       app.py         │   Streamlit UI: tabs, sidebar, session state
-└──────────┬───────────┘
-           │
-   ┌───────┴───────────────┐
-   ▼                       ▼
-document_processor   semantic_search
-   .py                  .py
-   │                    │
-   ├ parse_document     ├ load_model          (sentence-transformers)
-   ├ detect_sections    ├ encode_corpus       (torch tensors)
-   └ build_dataframe    ├ search              (cosine similarity)
-                        ├ extract_snippet     (sentence-level relevance)
-                        ├ highlight_terms     (HTML-safe <mark> highlighting)
-                        └ format_references
+         ┌─────────────────────────────────────────────────────────────┐
+         │                            app.py                           |
+         │          Streamlit UI: tabs, sidebar, session state         |
+         └─────────────────────────────────┬───────────────────────────┘
+                                           │
+                    ┌──────────────────────┴──────────────────────┐
+                    ▼                                             ▼
+          document_processor                              semantic_search
+                   .py                                          .py
+                   │                                             │
+                   ├ parse_document                              ├ load_model          (sentence-transformers)
+                   ├ detect_sections                             ├ encode_corpus       (torch tensors)
+                   └ build_dataframe                             ├ search              (cosine similarity)
+                                                                 ├ extract_snippet     (sentence-level relevance)
+                                                                 ├ highlight_terms     (HTML-safe <mark> highlighting)
+                                                                 └ format_references
 ```
 
 ### Workflow
