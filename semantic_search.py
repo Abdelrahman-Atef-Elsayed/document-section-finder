@@ -1,5 +1,3 @@
-"""Semantic search: embedding model loading and similarity search."""
-
 from __future__ import annotations
 
 import html
@@ -7,16 +5,37 @@ import re
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
+import numpy as np
 import pandas as pd
 import torch
 from sentence_transformers import SentenceTransformer, util
 
+try:
+    from rank_bm25 import BM25Okapi
+    BM25_AVAILABLE = True
+except ImportError:
+    BM25_AVAILABLE = False
+
+try:
+    from sentence_transformers import CrossEncoder
+    CROSS_ENCODER_AVAILABLE = True
+except ImportError:
+    CROSS_ENCODER_AVAILABLE = False
+
+
+AVAILABLE_MODELS = {
+    "paraphrase-MiniLM-L6-v2": "Fast, general purpose",
+    "all-MiniLM-L6-v2": "General purpose (good quality)",
+    "multi-qa-MiniLM-L6-dot-v1": "Best for Q&A",
+    "all-mpnet-base-v2": "Best quality (larger)",
+    "BAAI/bge-small-en-v1.5": "Very fast, good quality",
+}
+
 DEFAULT_MODEL_NAME = "paraphrase-MiniLM-L6-v2"
-DEFAULT_DEVICE = "cpu"
+CROSS_ENCODER_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 CONTENT_PREVIEW_CHARS = 500
 DEFAULT_SNIPPET_CHARS = 500
 
-# Common English stopwords filtered out before highlighting.
 _HIGHLIGHT_STOPWORDS = frozenset(
     {
         "the", "a", "an", "is", "are", "was", "were", "be", "been", "being",
@@ -34,10 +53,14 @@ _HIGHLIGHT_STOPWORDS = frozenset(
 @dataclass
 class SearchResult:
     similarity: float
-    number: str
-    title: str
-    content: str
-    source: str
+    score_bm25: float = 0.0
+    score_semantic: float = 0.0
+    score_rerank: float = 0.0
+    number: str = ""
+    title: str = ""
+    content: str = ""
+    source: str = ""
+    page_number: int = 0
     snippet_html: str = ""
 
     def to_dict(self) -> dict:
@@ -47,24 +70,47 @@ class SearchResult:
             "title": self.title,
             "content": self.content,
             "source": self.source,
+            "page_number": self.page_number,
             "snippet_html": self.snippet_html,
         }
 
 
-def load_model(model_name: str = DEFAULT_MODEL_NAME, device: str = DEFAULT_DEVICE) -> SentenceTransformer:
-    """Load the sentence-transformer model and warm it up."""
+_cross_encoder_model = None
+
+
+def load_model(model_name: str = DEFAULT_MODEL_NAME, device: str = "cpu") -> SentenceTransformer:
     model = SentenceTransformer(model_name, device=device)
     with torch.no_grad():
         _ = model.encode("warmup", convert_to_tensor=True)
     return model
 
 
+def load_cross_encoder(device: str = "cpu") -> Optional:
+    global _cross_encoder_model
+    if not CROSS_ENCODER_AVAILABLE:
+        return None
+    if _cross_encoder_model is None:
+        _cross_encoder_model = CrossEncoder(CROSS_ENCODER_MODEL, device=device)
+    return _cross_encoder_model
+
+
 def encode_corpus(model: SentenceTransformer, df: pd.DataFrame) -> Optional[torch.Tensor]:
-    """Encode the search_text column of a DataFrame into a tensor of embeddings."""
     if df.empty:
         return None
     texts = [t if isinstance(t, str) and t.strip() else "N/A" for t in df["search_text"].tolist()]
     return model.encode(texts, convert_to_tensor=True, show_progress_bar=False)
+
+
+def _prepare_bm25(df: pd.DataFrame) -> Optional:
+    if not BM25_AVAILABLE:
+        return None
+    texts = df["search_text"].tolist() if "search_text" in df.columns else df["content"].tolist()
+    tokenized = [_tokenize(t) for t in texts]
+    return BM25Okapi(tokenized)
+
+
+def _tokenize(text: str) -> List[str]:
+    return re.findall(r"\b\w+\b", text.lower())
 
 
 def search(
@@ -75,56 +121,115 @@ def search(
     top_k: int = 10,
     min_similarity: float = 0.3,
     snippet_chars: int = DEFAULT_SNIPPET_CHARS,
+    use_hybrid: bool = True,
+    use_cross_encoder: bool = False,
+    bm25_weight: float = 0.3,
 ) -> Tuple[List[SearchResult], List[str]]:
-    """Return ranked SearchResult list plus the matching section numbers.
-
-    Each result includes a `snippet_html` field: the most query-relevant
-    sentences from the section content with matched query terms wrapped in
-    ``<mark>`` tags. Safe to render with ``unsafe_allow_html=True``.
-    """
-    if df.empty or embeddings is None or not query.strip():
+    if df.empty or not query.strip():
         return [], []
 
-    query_emb = model.encode(query, convert_to_tensor=True)
-    scores = util.pytorch_cos_sim(query_emb, embeddings)[0]
-    top = torch.topk(scores, k=min(top_k, len(scores)))
+    num_docs = len(df)
+    effective_k = min(top_k * 3, num_docs)
+
+    bm25_scores = None
+    if use_hybrid and BM25_AVAILABLE:
+        bm25 = _prepare_bm25(df)
+        if bm25:
+            tokenized_query = _tokenize(query)
+            raw_scores = bm25.get_scores(tokenized_query)
+            raw_scores = np.where(raw_scores < 0, 0, raw_scores)
+            max_score = raw_scores.max() if raw_scores.max() > 0 else 1.0
+            bm25_scores = raw_scores / max_score
+
+    semantic_scores = None
+    if embeddings is not None:
+        query_emb = model.encode(query, convert_to_tensor=True)
+        semantic_scores = util.pytorch_cos_sim(query_emb, embeddings)[0].cpu().numpy()
+
+    combined_scores = None
+    if semantic_scores is not None and bm25_scores is not None:
+        combined_scores = (1 - bm25_weight) * semantic_scores + bm25_weight * bm25_scores
+    elif semantic_scores is not None:
+        combined_scores = semantic_scores
+    elif bm25_scores is not None:
+        combined_scores = bm25_scores
+    else:
+        return [], []
+
+    top_indices = np.argsort(combined_scores)[::-1][:effective_k]
+
+    df_subset = df.iloc[top_indices].copy()
+
+    if use_cross_encoder and CROSS_ENCODER_AVAILABLE:
+        ce_model = load_cross_encoder()
+        if ce_model:
+            pairs = [[query, str(df_subset.iloc[i]["search_text"])] for i in range(len(df_subset))]
+            ce_scores = ce_model.predict(pairs)
+            for i in range(len(df_subset)):
+                df_subset.iloc[i, df_subset.columns.get_loc("_ce_score") if "_ce_score" in df_subset.columns else -1] = 0
+            df_subset["_ce_score"] = ce_scores
+            df_subset = df_subset.sort_values("_ce_score", ascending=False)
+            top_indices_final = df_subset.index[:top_k]
+        else:
+            hybrid_order = np.argsort(combined_scores[top_indices])[::-1]
+            top_indices_final = top_indices[hybrid_order][:top_k]
+    else:
+        hybrid_order = np.argsort(combined_scores[top_indices])[::-1]
+        top_indices_final = top_indices[hybrid_order][:top_k]
 
     results: List[SearchResult] = []
     numbers: List[str] = []
-    for score, idx in zip(top.values, top.indices):
-        value = score.item()
-        if value < min_similarity:
+
+    for idx in top_indices_final:
+        row = df.iloc[idx]
+        final_score = combined_scores[idx]
+        sem_score = float(semantic_scores[idx]) if semantic_scores is not None else 0.0
+        bm25_val = float(bm25_scores[idx]) if bm25_scores is not None else 0.0
+
+        if final_score < min_similarity:
             continue
-        row = df.iloc[idx.item()]
+
         full_content = str(row.get("content", "N/A"))
-        snippet = (
-            extract_snippet(model, query_emb, full_content, max_chars=snippet_chars)
-            if full_content and full_content != "N/A"
-            else ""
-        )
+        ce_score = 0.0
+        if use_cross_encoder and CROSS_ENCODER_AVAILABLE and "_ce_score" in df_subset.columns:
+            lc = df_subset.loc[df_subset.index == idx]
+            if not lc.empty:
+                ce_score = float(lc["_ce_score"].iloc[0])
+
+        query_emb = None
+        if embeddings is not None:
+            query_emb = model.encode(query, convert_to_tensor=True)
+            snippet = (
+                extract_snippet(model, query_emb, full_content, max_chars=snippet_chars)
+                if full_content and full_content != "N/A"
+                else ""
+            )
+        else:
+            snippet = ""
+
         snippet_html = highlight_terms(snippet, query) if snippet else ""
 
         result = SearchResult(
-            similarity=round(value, 3),
+            similarity=round(float(final_score), 3),
+            score_bm25=round(bm25_val, 3),
+            score_semantic=round(sem_score, 3),
+            score_rerank=round(float(ce_score), 3),
             number=str(row.get("number", "N/A")),
             title=str(row.get("title", "N/A")),
             content=full_content[:CONTENT_PREVIEW_CHARS],
             source=str(row.get("source", "N/A")),
+            page_number=int(row.get("page_number", 0)),
             snippet_html=snippet_html,
         )
         results.append(result)
         numbers.append(result.number)
-    return results, numbers
 
+    return results[:top_k], numbers[:top_k]
 
-# Snippet extraction and highlighting
 
 _SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+(?=[A-Z0-9\"'(\[])")
-_WORD_RE = re.compile(r"\b\w+\b")
-
 
 def _split_sentences(text: str) -> List[str]:
-    """Lightweight sentence splitter — punctuation first, newlines as fallback."""
     text = text.strip()
     if not text:
         return []
@@ -140,7 +245,6 @@ def extract_snippet(
     content: str,
     max_chars: int = DEFAULT_SNIPPET_CHARS,
 ) -> str:
-    """Pick the most query-relevant span (one or more sentences) from content."""
     if not content:
         return ""
     if len(content) <= max_chars:
@@ -178,12 +282,10 @@ def extract_snippet(
     return " ".join(pieces)
 
 
-def highlight_terms(text: str, query: str) -> str:
-    """HTML-escape `text` and wrap query terms in ``<mark>`` tags.
+_WORD_RE = re.compile(r"\b\w+\b")
 
-    Stopwords and very short tokens are ignored. Output is safe HTML — the text
-    is escaped first, and only the ``<mark>`` tags we add are unescaped.
-    """
+
+def highlight_terms(text: str, query: str) -> str:
     escaped = html.escape(text)
     raw_terms = _WORD_RE.findall(query.lower())
     terms = {t for t in raw_terms if len(t) > 2 and t not in _HIGHLIGHT_STOPWORDS}
@@ -199,9 +301,8 @@ def highlight_terms(text: str, query: str) -> str:
 
 
 def format_section_references(section_numbers: List[str]) -> str:
-    """Format unique section numbers as a comma-separated string."""
     if not section_numbers:
-        return "No matching sections found"
+        return "No matching paragraphs found"
     seen = set()
     unique = []
     for num in section_numbers:
@@ -212,7 +313,6 @@ def format_section_references(section_numbers: List[str]) -> str:
 
 
 def similarity_badge(score: float) -> str:
-    """Return a markdown badge string colour-coded by score band."""
     if score >= 0.7:
         return f"🟢 **{score:.1%}**"
     if score >= 0.5:
